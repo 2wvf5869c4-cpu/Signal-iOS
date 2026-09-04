@@ -54,6 +54,30 @@ public class MockTSAccountManager: TSAccountManager {
         return storedDeviceIdWithMaybeTransaction
     }
 
+    public var allLocalIdentifiersMock: (() -> [LocalIdentifiers]) = {
+        [.forUnitTests]
+    }
+
+    open var allLocalIdentifiersWithMaybeSneakyTransaction: [LocalIdentifiers] {
+        allLocalIdentifiersMock()
+    }
+
+    open func allLocalIdentifiers(tx: DBReadTransaction) -> [LocalIdentifiers] {
+        allLocalIdentifiersWithMaybeSneakyTransaction
+    }
+
+    public var switchToAccountMock: ((Aci) -> Bool) = { _ in true }
+
+    open func switchToAccount(aci: Aci, tx: DBWriteTransaction) -> Bool {
+        switchToAccountMock(aci)
+    }
+
+    public var removeAccountMock: ((Aci) -> Void) = { _ in }
+
+    open func removeAccount(aci: Aci, tx: DBWriteTransaction) {
+        removeAccountMock(aci)
+    }
+
     // MARK: - Registration State
 
     public var registrationStateMock: (() -> TSRegistrationState) = {

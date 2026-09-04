@@ -8689,6 +8689,21 @@
 /* Label for button in settings to get your account data report */
 "SETTINGS_ACCOUNT_DATA_REPORT_BUTTON" = "Your Account Data";
 
+/* Title for multi-account section in account settings. */
+"SETTINGS_MULTI_ACCOUNT_SECTION_TITLE" = "Accounts on This Device";
+
+/* Accessory label for the currently active account. */
+"SETTINGS_MULTI_ACCOUNT_CURRENT_LABEL" = "Current";
+
+/* Action title to switch to a selected account. */
+"SETTINGS_MULTI_ACCOUNT_SWITCH_ACTION" = "Switch to This Account";
+
+/* Action title to remove a saved account from this device. */
+"SETTINGS_MULTI_ACCOUNT_REMOVE_ACTION" = "Remove from This Device";
+
+/* Confirmation title format when removing a saved account from this device. Embeds phone number. */
+"SETTINGS_MULTI_ACCOUNT_REMOVE_CONFIRM_TITLE_FORMAT" = "Remove %1$@ from this device?";
+
 /* Title for the 'add to block list' view. */
 "SETTINGS_ADD_TO_BLOCK_LIST_TITLE" = "Block";
 

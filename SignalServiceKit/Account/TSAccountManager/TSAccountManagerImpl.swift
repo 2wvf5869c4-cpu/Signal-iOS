@@ -92,6 +92,57 @@ public class TSAccountManagerImpl: TSAccountManager {
         return getOrLoadAccountState(tx: tx).deviceId
     }
 
+    public var allLocalIdentifiersWithMaybeSneakyTransaction: [LocalIdentifiers] {
+        return db.read { tx in
+            return accountStateLock.withLock {
+                return loadStoredAccounts(tx: tx).map(\.localIdentifiers)
+            }
+        }
+    }
+
+    public func allLocalIdentifiers(tx: DBReadTransaction) -> [LocalIdentifiers] {
+        return accountStateLock.withLock {
+            return loadStoredAccounts(tx: tx).map(\.localIdentifiers)
+        }
+    }
+
+    public func switchToAccount(aci: Aci, tx: DBWriteTransaction) -> Bool {
+        return mutateWithLock(tx: tx) {
+            var accounts = loadStoredAccounts(tx: tx)
+            guard let account = accounts.first(where: { $0.localIdentifiers.aci == aci }) else {
+                return false
+            }
+            writeLegacyAccountState(account, tx: tx)
+            writeActiveAccountAci(aci.serviceIdUppercaseString, tx: tx)
+            upsertStoredAccount(account, accounts: &accounts, tx: tx)
+            return true
+        }
+    }
+
+    public func removeAccount(aci: Aci, tx: DBWriteTransaction) {
+        mutateWithLock(tx: tx) {
+            var accounts = loadStoredAccounts(tx: tx)
+            let originalCount = accounts.count
+            accounts.removeAll(where: { $0.localIdentifiers.aci == aci })
+            guard accounts.count != originalCount else {
+                return
+            }
+
+            writeStoredAccounts(accounts, tx: tx)
+
+            let activeAci = activeAccountAci(tx: tx)
+            if activeAci == aci.serviceIdUppercaseString {
+                if let replacement = accounts.first {
+                    writeLegacyAccountState(replacement, tx: tx)
+                    writeActiveAccountAci(replacement.localIdentifiers.aci.serviceIdUppercaseString, tx: tx)
+                } else {
+                    clearLegacyAccountState(tx: tx)
+                    writeActiveAccountAci(nil, tx: tx)
+                }
+            }
+        }
+    }
+
     // MARK: - Registration IDs
 
     public func getRegistrationId(for identity: OWSIdentity, tx: DBReadTransaction) -> UInt32? {
@@ -107,12 +158,28 @@ public class TSAccountManagerImpl: TSAccountManager {
         case .aci: Keys.aciRegistrationIdKey
         case .pni: Keys.pniRegistrationIdKey
         }
-        kvStore.writeValue(Int64(newRegistrationId), forKey: key, tx: tx)
+        mutateWithLock(tx: tx) {
+            kvStore.writeValue(Int64(newRegistrationId), forKey: key, tx: tx)
+            updateStoredActiveAccount(tx: tx) { account in
+                switch identity {
+                case .aci:
+                    account.aciRegistrationId = newRegistrationId
+                case .pni:
+                    account.pniRegistrationId = newRegistrationId
+                }
+            }
+        }
     }
 
     public func clearRegistrationIds(tx: DBWriteTransaction) {
-        kvStore.removeValue(forKey: Keys.aciRegistrationIdKey, tx: tx)
-        kvStore.removeValue(forKey: Keys.pniRegistrationIdKey, tx: tx)
+        mutateWithLock(tx: tx) {
+            kvStore.removeValue(forKey: Keys.aciRegistrationIdKey, tx: tx)
+            kvStore.removeValue(forKey: Keys.pniRegistrationIdKey, tx: tx)
+            updateStoredActiveAccount(tx: tx) { account in
+                account.aciRegistrationId = nil
+                account.pniRegistrationId = nil
+            }
+        }
     }
 
     // MARK: - Manual Message Fetch
@@ -124,6 +191,9 @@ public class TSAccountManagerImpl: TSAccountManager {
     public func setIsManualMessageFetchEnabled(_ isEnabled: Bool, tx: DBWriteTransaction) {
         mutateWithLock(tx: tx) {
             kvStore.writeValue(isEnabled, forKey: Keys.isManualMessageFetchEnabled, tx: tx)
+            updateStoredActiveAccount(tx: tx) { account in
+                account.isManualMessageFetchEnabled = isEnabled
+            }
         }
     }
 
@@ -153,6 +223,10 @@ extension TSAccountManagerImpl: PhoneNumberDiscoverabilitySetter {
                 forKey: Keys.lastSetIsDiscoverableByPhoneNumber,
                 tx: tx,
             )
+            updateStoredActiveAccount(tx: tx) { account in
+                account.phoneNumberDiscoverability = phoneNumberDiscoverability
+                account.lastSetIsDiscoverableByPhoneNumberAt = dateProvider()
+            }
         }
     }
 }
@@ -190,6 +264,21 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             kvStore.removeValue(forKey: Keys.reregistrationPhoneNumber, tx: tx)
             kvStore.removeValue(forKey: Keys.reregistrationAci, tx: tx)
             kvStore.removeValue(forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
+
+            upsertStoredAccount(
+                StoredAccount(
+                    localIdentifiers: LocalIdentifiers(aci: aci, pni: phoneNumber.pni, e164: phoneNumber.e164),
+                    deviceId: deviceId,
+                    serverAuthToken: serverAuthToken,
+                    registrationDate: dateProvider(),
+                    aciRegistrationId: kvStore.fetchValue(Int64.self, forKey: Keys.aciRegistrationIdKey, tx: tx).map(UInt32.init(truncatingIfNeeded:)),
+                    pniRegistrationId: kvStore.fetchValue(Int64.self, forKey: Keys.pniRegistrationIdKey, tx: tx).map(UInt32.init(truncatingIfNeeded:)),
+                    isManualMessageFetchEnabled: kvStore.fetchValue(Bool.self, forKey: Keys.isManualMessageFetchEnabled, tx: tx) ?? false,
+                    phoneNumberDiscoverability: kvStore.fetchValue(Bool.self, forKey: Keys.isDiscoverableByPhoneNumber, tx: tx).map { $0 ? .everybody : .nobody },
+                    lastSetIsDiscoverableByPhoneNumberAt: kvStore.fetchValue(Date.self, forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx),
+                ),
+                tx: tx,
+            )
         }
     }
 
@@ -211,6 +300,10 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             Self.regStateLogger.info("local pni \(oldPni ?? "nil") -> \(phoneNumber.pni)")
             // Encoded without the "PNI:" prefix for backwards compatibility.
             kvStore.writeValue(phoneNumber.pni.rawUUID.uuidString, forKey: Keys.localPni, tx: tx)
+
+            updateStoredActiveAccount(tx: tx) { account in
+                account.localIdentifiers = LocalIdentifiers(aci: aci, pni: phoneNumber.pni, e164: phoneNumber.e164)
+            }
         }
     }
 
@@ -248,6 +341,8 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             kvStore.writeValue(wasPrimaryDevice, forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
 
             let keysToKeep: Set<String> = [
+                Keys.activeAccountAci,
+                Keys.storedAccounts,
                 Keys.isDiscoverableByPhoneNumber,
                 Keys.lastSetIsDiscoverableByPhoneNumber,
                 Keys.reregistrationAci,
@@ -350,6 +445,218 @@ extension TSAccountManagerImpl: DatabaseChangeDelegate {
 extension TSAccountManagerImpl {
 
     private typealias Keys = AccountState.Keys
+
+    private struct StoredAccount: Codable {
+        var aci: String
+        var pni: String?
+        var phoneNumber: String
+        var deviceId: UInt32
+        var serverAuthToken: String?
+        var registrationDate: Date?
+        var aciRegistrationId: UInt32?
+        var pniRegistrationId: UInt32?
+        var isManualMessageFetchEnabled: Bool
+        var isDiscoverableByPhoneNumber: Bool?
+        var lastSetIsDiscoverableByPhoneNumberAt: Date?
+
+        init(
+            localIdentifiers: LocalIdentifiers,
+            deviceId: DeviceId,
+            serverAuthToken: String?,
+            registrationDate: Date?,
+            aciRegistrationId: UInt32?,
+            pniRegistrationId: UInt32?,
+            isManualMessageFetchEnabled: Bool,
+            phoneNumberDiscoverability: PhoneNumberDiscoverability?,
+            lastSetIsDiscoverableByPhoneNumberAt: Date?,
+        ) {
+            self.aci = localIdentifiers.aci.serviceIdUppercaseString
+            self.pni = localIdentifiers.pni?.rawUUID.uuidString
+            self.phoneNumber = localIdentifiers.phoneNumber
+            self.deviceId = deviceId.uint32Value
+            self.serverAuthToken = serverAuthToken
+            self.registrationDate = registrationDate
+            self.aciRegistrationId = aciRegistrationId
+            self.pniRegistrationId = pniRegistrationId
+            self.isManualMessageFetchEnabled = isManualMessageFetchEnabled
+            self.isDiscoverableByPhoneNumber = phoneNumberDiscoverability?.isDiscoverable
+            self.lastSetIsDiscoverableByPhoneNumberAt = lastSetIsDiscoverableByPhoneNumberAt
+        }
+
+        init(
+            aci: String,
+            pni: String?,
+            phoneNumber: String,
+            deviceId: UInt32,
+            serverAuthToken: String?,
+            registrationDate: Date?,
+            aciRegistrationId: UInt32?,
+            pniRegistrationId: UInt32?,
+            isManualMessageFetchEnabled: Bool,
+            isDiscoverableByPhoneNumber: Bool?,
+            lastSetIsDiscoverableByPhoneNumberAt: Date?,
+        ) {
+            self.aci = aci
+            self.pni = pni
+            self.phoneNumber = phoneNumber
+            self.deviceId = deviceId
+            self.serverAuthToken = serverAuthToken
+            self.registrationDate = registrationDate
+            self.aciRegistrationId = aciRegistrationId
+            self.pniRegistrationId = pniRegistrationId
+            self.isManualMessageFetchEnabled = isManualMessageFetchEnabled
+            self.isDiscoverableByPhoneNumber = isDiscoverableByPhoneNumber
+            self.lastSetIsDiscoverableByPhoneNumberAt = lastSetIsDiscoverableByPhoneNumberAt
+        }
+
+        var localIdentifiers: LocalIdentifiers {
+            guard let parsedAci = Aci.parseFrom(aciString: aci) else {
+                owsFail("Invalid stored ACI.")
+            }
+            return LocalIdentifiers(
+                aci: parsedAci,
+                pni: Pni.parseFrom(pniString: pni),
+                phoneNumber: phoneNumber,
+            )
+        }
+
+        var localDeviceId: LocalDeviceId {
+            guard let deviceId = DeviceId(validating: deviceId) else {
+                return .invalid
+            }
+            return .valid(deviceId)
+        }
+
+        var phoneNumberDiscoverability: PhoneNumberDiscoverability? {
+            isDiscoverableByPhoneNumber.map { $0 ? .everybody : .nobody }
+        }
+    }
+
+    private func loadStoredAccounts(tx: DBReadTransaction) -> [StoredAccount] {
+        guard let data = kvStore.fetchValue(Data.self, forKey: Keys.storedAccounts, tx: tx) else {
+            if let legacyAccount = loadCurrentLegacyStoredAccount(tx: tx) {
+                return [legacyAccount]
+            }
+            return []
+        }
+        do {
+            let decoded = try JSONDecoder().decode([StoredAccount].self, from: data)
+            return decoded.filter { Aci.parseFrom(aciString: $0.aci) != nil }
+        } catch {
+            owsFailDebug("Failed to decode stored accounts: \(error)")
+            return []
+        }
+    }
+
+    private func writeStoredAccounts(_ accounts: [StoredAccount], tx: DBWriteTransaction) {
+        do {
+            let encoded = try JSONEncoder().encode(accounts)
+            kvStore.writeValue(encoded, forKey: Keys.storedAccounts, tx: tx)
+        } catch {
+            owsFailDebug("Failed to encode stored accounts: \(error)")
+        }
+    }
+
+    private func activeAccountAci(tx: DBReadTransaction) -> String? {
+        return kvStore.fetchValue(String.self, forKey: Keys.activeAccountAci, tx: tx)
+    }
+
+    private func writeActiveAccountAci(_ aci: String?, tx: DBWriteTransaction) {
+        kvStore.writeValue(aci, forKey: Keys.activeAccountAci, tx: tx)
+    }
+
+    private func upsertStoredAccount(_ account: StoredAccount, tx: DBWriteTransaction) {
+        var accounts = loadStoredAccounts(tx: tx)
+        upsertStoredAccount(account, accounts: &accounts, tx: tx)
+    }
+
+    private func upsertStoredAccount(_ account: StoredAccount, accounts: inout [StoredAccount], tx: DBWriteTransaction) {
+        if let existingIndex = accounts.firstIndex(where: { $0.aci == account.aci }) {
+            accounts[existingIndex] = account
+        } else {
+            accounts.append(account)
+        }
+        writeStoredAccounts(accounts, tx: tx)
+        writeActiveAccountAci(account.aci, tx: tx)
+    }
+
+    private func updateStoredActiveAccount(tx: DBWriteTransaction, _ block: (inout StoredAccount) -> Void) {
+        guard let legacyAccount = loadCurrentLegacyStoredAccount(tx: tx) else {
+            return
+        }
+        var accounts = loadStoredAccounts(tx: tx)
+        let currentAci = activeAccountAci(tx: tx) ?? legacyAccount.aci
+        var account = accounts.first(where: { $0.aci == currentAci }) ?? legacyAccount
+        block(&account)
+        upsertStoredAccount(account, accounts: &accounts, tx: tx)
+    }
+
+    private func loadCurrentLegacyStoredAccount(tx: DBReadTransaction) -> StoredAccount? {
+        guard
+            let phoneNumber = kvStore.fetchValue(String.self, forKey: Keys.localPhoneNumber, tx: tx),
+            let aci = kvStore.fetchValue(String.self, forKey: Keys.localAci, tx: tx),
+            Aci.parseFrom(aciString: aci) != nil
+        else {
+            return nil
+        }
+        let pni = kvStore.fetchValue(String.self, forKey: Keys.localPni, tx: tx)
+        let deviceId = kvStore.fetchValue(Int64.self, forKey: Keys.deviceId, tx: tx).map(UInt32.init(truncatingIfNeeded:))
+            ?? DeviceId.primary.uint32Value
+        return StoredAccount(
+            aci: aci,
+            pni: pni,
+            phoneNumber: phoneNumber,
+            deviceId: deviceId,
+            serverAuthToken: kvStore.fetchValue(String.self, forKey: Keys.serverAuthToken, tx: tx),
+            registrationDate: kvStore.fetchValue(Date.self, forKey: Keys.registrationDate, tx: tx),
+            aciRegistrationId: kvStore.fetchValue(Int64.self, forKey: Keys.aciRegistrationIdKey, tx: tx).map(UInt32.init(truncatingIfNeeded:)),
+            pniRegistrationId: kvStore.fetchValue(Int64.self, forKey: Keys.pniRegistrationIdKey, tx: tx).map(UInt32.init(truncatingIfNeeded:)),
+            isManualMessageFetchEnabled: kvStore.fetchValue(Bool.self, forKey: Keys.isManualMessageFetchEnabled, tx: tx) ?? false,
+            isDiscoverableByPhoneNumber: kvStore.fetchValue(Bool.self, forKey: Keys.isDiscoverableByPhoneNumber, tx: tx),
+            lastSetIsDiscoverableByPhoneNumberAt: kvStore.fetchValue(Date.self, forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx),
+        )
+    }
+
+    private func writeLegacyAccountState(_ account: StoredAccount, tx: DBWriteTransaction) {
+        kvStore.writeValue(account.phoneNumber, forKey: Keys.localPhoneNumber, tx: tx)
+        kvStore.writeValue(account.aci, forKey: Keys.localAci, tx: tx)
+        kvStore.writeValue(account.pni, forKey: Keys.localPni, tx: tx)
+        kvStore.writeValue(Int64(account.deviceId), forKey: Keys.deviceId, tx: tx)
+        kvStore.writeValue(account.serverAuthToken, forKey: Keys.serverAuthToken, tx: tx)
+        kvStore.writeValue(account.registrationDate, forKey: Keys.registrationDate, tx: tx)
+        kvStore.writeValue(account.aciRegistrationId.map(Int64.init), forKey: Keys.aciRegistrationIdKey, tx: tx)
+        kvStore.writeValue(account.pniRegistrationId.map(Int64.init), forKey: Keys.pniRegistrationIdKey, tx: tx)
+        kvStore.writeValue(account.isManualMessageFetchEnabled, forKey: Keys.isManualMessageFetchEnabled, tx: tx)
+        kvStore.writeValue(account.isDiscoverableByPhoneNumber, forKey: Keys.isDiscoverableByPhoneNumber, tx: tx)
+        kvStore.writeValue(account.lastSetIsDiscoverableByPhoneNumberAt, forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx)
+
+        kvStore.removeValue(forKey: Keys.isDeregisteredOrDelinked, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationPhoneNumber, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationAci, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
+        kvStore.removeValue(forKey: Keys.isTransferInProgress, tx: tx)
+        kvStore.removeValue(forKey: Keys.wasTransferred, tx: tx)
+    }
+
+    private func clearLegacyAccountState(tx: DBWriteTransaction) {
+        kvStore.removeValue(forKey: Keys.localPhoneNumber, tx: tx)
+        kvStore.removeValue(forKey: Keys.localAci, tx: tx)
+        kvStore.removeValue(forKey: Keys.localPni, tx: tx)
+        kvStore.removeValue(forKey: Keys.deviceId, tx: tx)
+        kvStore.removeValue(forKey: Keys.serverAuthToken, tx: tx)
+        kvStore.removeValue(forKey: Keys.registrationDate, tx: tx)
+        kvStore.removeValue(forKey: Keys.aciRegistrationIdKey, tx: tx)
+        kvStore.removeValue(forKey: Keys.pniRegistrationIdKey, tx: tx)
+        kvStore.removeValue(forKey: Keys.isManualMessageFetchEnabled, tx: tx)
+        kvStore.removeValue(forKey: Keys.isDiscoverableByPhoneNumber, tx: tx)
+        kvStore.removeValue(forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx)
+        kvStore.removeValue(forKey: Keys.isDeregisteredOrDelinked, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationPhoneNumber, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationAci, tx: tx)
+        kvStore.removeValue(forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
+        kvStore.removeValue(forKey: Keys.isTransferInProgress, tx: tx)
+        kvStore.removeValue(forKey: Keys.wasTransferred, tx: tx)
+    }
 
     // MARK: - External methods (acquire the lock)
 
@@ -622,6 +929,8 @@ extension TSAccountManagerImpl {
             static let lastSetIsDiscoverableByPhoneNumber = "TSAccountManager_LastSetIsDiscoverableByPhoneNumberKey"
 
             static let isManualMessageFetchEnabled = "TSAccountManager_ManualMessageFetchKey"
+            static let storedAccounts = "TSAccountManager_StoredAccounts"
+            static let activeAccountAci = "TSAccountManager_ActiveAccountAci"
         }
     }
 }

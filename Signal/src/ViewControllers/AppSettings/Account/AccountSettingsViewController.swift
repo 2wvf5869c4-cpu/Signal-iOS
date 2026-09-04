@@ -18,6 +18,26 @@ class AccountSettingsViewController: OWSTableViewController2 {
 
     private let accountSettingsTitle = OWSLocalizedString("SETTINGS_ACCOUNT", comment: "Title for the 'account' link in settings.")
     private let proceedTitle = OWSLocalizedString("PROCEED_BUTTON", comment: "")
+    private let multiAccountSectionTitle = OWSLocalizedString(
+        "SETTINGS_MULTI_ACCOUNT_SECTION_TITLE",
+        comment: "Title for multi-account section in account settings.",
+    )
+    private let multiAccountCurrentLabel = OWSLocalizedString(
+        "SETTINGS_MULTI_ACCOUNT_CURRENT_LABEL",
+        comment: "Accessory label for the currently active account.",
+    )
+    private let multiAccountSwitchActionTitle = OWSLocalizedString(
+        "SETTINGS_MULTI_ACCOUNT_SWITCH_ACTION",
+        comment: "Action title to switch to a selected account.",
+    )
+    private let multiAccountRemoveActionTitle = OWSLocalizedString(
+        "SETTINGS_MULTI_ACCOUNT_REMOVE_ACTION",
+        comment: "Action title to remove a saved account from this device.",
+    )
+    private let multiAccountRemoveConfirmTitleFormat = OWSLocalizedString(
+        "SETTINGS_MULTI_ACCOUNT_REMOVE_CONFIRM_TITLE_FORMAT",
+        comment: "Confirmation title format when removing a saved account from device. Embeds phone number. Example: Remove +14155550123 from this device?",
+    )
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -36,6 +56,7 @@ class AccountSettingsViewController: OWSTableViewController2 {
 
     func updateTableContents() {
         let contents = OWSTableContents()
+        addMultiAccountSection(to: contents)
 
         // Show the change pin and reglock sections
         if DependenciesBridge.shared.tsAccountManager.registrationStateWithMaybeSneakyTransaction.isRegisteredPrimaryDevice {
@@ -224,6 +245,32 @@ class AccountSettingsViewController: OWSTableViewController2 {
 
     // MARK: - Section contents
 
+    private func addMultiAccountSection(to contents: OWSTableContents) {
+        let tsAccountManager = DependenciesBridge.shared.tsAccountManager
+        let allAccounts = tsAccountManager.allLocalIdentifiersWithMaybeSneakyTransaction
+        guard allAccounts.count > 1 else {
+            return
+        }
+
+        let activeAci = tsAccountManager.localIdentifiersWithMaybeSneakyTransaction?.aci
+        let section = OWSTableSection()
+        section.headerTitle = multiAccountSectionTitle
+
+        for account in allAccounts {
+            let isActive = account.aci == activeAci
+            section.add(.item(
+                name: account.phoneNumber,
+                accessoryText: isActive ? multiAccountCurrentLabel : nil,
+                accessoryType: isActive ? .none : .disclosureIndicator,
+                actionBlock: isActive ? nil : { [weak self] in
+                    self?.presentMultiAccountActionSheet(account)
+                },
+            ))
+        }
+
+        contents.add(section)
+    }
+
     private func addDeleteLocalDataSection(to contents: OWSTableContents) {
         let deleteSection = OWSTableSection()
         deleteSection.add(.actionItem(
@@ -242,6 +289,53 @@ class AccountSettingsViewController: OWSTableViewController2 {
             comment: "Footer below the 'delete app data' button, shown on a linked device's account settings.",
         )
         contents.add(deleteSection)
+    }
+
+    private func presentMultiAccountActionSheet(_ account: LocalIdentifiers) {
+        let actionSheet = ActionSheetController(title: account.phoneNumber)
+        actionSheet.addAction(ActionSheetAction(title: multiAccountSwitchActionTitle) { [weak self] _ in
+            self?.switchToAccount(account)
+        })
+        actionSheet.addAction(ActionSheetAction(
+            title: multiAccountRemoveActionTitle,
+            style: .destructive,
+            handler: { [weak self] _ in
+                self?.confirmRemoveAccount(account)
+            },
+        ))
+        actionSheet.addAction(OWSActionSheets.cancelAction)
+        presentActionSheet(actionSheet)
+    }
+
+    private func switchToAccount(_ account: LocalIdentifiers) {
+        let didSwitch = SSKEnvironment.shared.databaseStorageRef.write { tx in
+            DependenciesBridge.shared.tsAccountManager.switchToAccount(aci: account.aci, tx: tx)
+        }
+        guard didSwitch else {
+            return
+        }
+        updateTableContents()
+        tableView.reloadData()
+    }
+
+    private func confirmRemoveAccount(_ account: LocalIdentifiers) {
+        OWSActionSheets.showConfirmationAlert(
+            title: String.localizedStringWithFormat(multiAccountRemoveConfirmTitleFormat, account.phoneNumber),
+            proceedTitle: CommonStrings.deleteButton,
+            proceedStyle: .destructive,
+            proceedAction: { [weak self] _ in
+                self?.removeAccount(account)
+            },
+            fromViewController: self,
+        )
+    }
+
+    private func removeAccount(_ account: LocalIdentifiers) {
+        SSKEnvironment.shared.databaseStorageRef.write { tx in
+            DependenciesBridge.shared.tsAccountManager.removeAccount(aci: account.aci, tx: tx)
+        }
+        updateTableContents()
+        tableView.reloadData()
     }
 
     private func linkedDeviceCardCell() -> UITableViewCell {
