@@ -28,6 +28,11 @@ public protocol TSAccountManager {
 
     func storedDeviceId(tx: DBReadTransaction) -> LocalDeviceId
 
+    var allLocalIdentifiersWithMaybeSneakyTransaction: [LocalIdentifiers] { get }
+    func allLocalIdentifiers(tx: DBReadTransaction) -> [LocalIdentifiers]
+    func switchToAccount(aci: Aci, tx: DBWriteTransaction) -> Bool
+    func removeAccount(aci: Aci, tx: DBWriteTransaction)
+
     // MARK: - Registration State
 
     var registrationStateWithMaybeSneakyTransaction: TSRegistrationState { get }
