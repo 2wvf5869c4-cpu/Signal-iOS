@@ -112,6 +112,41 @@ final class TSAccountManagerImplMultiAccountTest: XCTestCase {
             XCTAssertEqual(tsAccountManager.registrationState(tx: tx), .unregistered)
         }
     }
+
+    func testSwitchRestoresDeregistrationState() {
+        let accountAci1 = Aci.constantForTesting("00000000-0000-4000-8000-0000000000A5")
+        let accountPni1 = Pni.constantForTesting("PNI:00000000-0000-4000-8000-0000000000B5")
+        let accountPhone1 = E164("+16505550105")!
+        let accountAci2 = Aci.constantForTesting("00000000-0000-4000-8000-0000000000A6")
+        let accountPni2 = Pni.constantForTesting("PNI:00000000-0000-4000-8000-0000000000B6")
+        let accountPhone2 = E164("+16505550106")!
+
+        db.write { tx in
+            tsAccountManager.initializeLocalIdentifiers(
+                aci: accountAci1,
+                phoneNumber: (accountPhone1, accountPni1),
+                deviceId: .primary,
+                serverAuthToken: "token-5",
+                tx: tx,
+            )
+            _ = tsAccountManager.setIsDeregisteredOrDelinked(true, tx: tx)
+        }
+        db.write { tx in
+            tsAccountManager.initializeLocalIdentifiers(
+                aci: accountAci2,
+                phoneNumber: (accountPhone2, accountPni2),
+                deviceId: .primary,
+                serverAuthToken: "token-6",
+                tx: tx,
+            )
+            XCTAssertTrue(tsAccountManager.registrationState(tx: tx).isRegistered)
+            XCTAssertTrue(tsAccountManager.switchToAccount(aci: accountAci1, tx: tx))
+        }
+
+        db.read { tx in
+            XCTAssertTrue(tsAccountManager.registrationState(tx: tx).isDeregistered)
+        }
+    }
 }
 
 private final class DatabaseChangeObserverMock: DatabaseChangeObserver {

@@ -115,6 +115,9 @@ public class TSAccountManagerImpl: TSAccountManager {
             writeLegacyAccountState(account, tx: tx)
             writeActiveAccountAci(aci.serviceIdUppercaseString, tx: tx)
             upsertStoredAccount(account, accounts: &accounts, tx: tx)
+            tx.addSyncCompletion {
+                NotificationCenter.default.post(name: .registrationStateDidChange, object: nil)
+            }
             return true
         }
     }
@@ -138,6 +141,9 @@ public class TSAccountManagerImpl: TSAccountManager {
                 } else {
                     clearLegacyAccountState(tx: tx)
                     writeActiveAccountAci(nil, tx: tx)
+                }
+                tx.addSyncCompletion {
+                    NotificationCenter.default.post(name: .registrationStateDidChange, object: nil)
                 }
             }
         }
@@ -323,6 +329,9 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             } else {
                 kvStore.removeValue(forKey: Keys.isDeregisteredOrDelinked, tx: tx)
             }
+            updateStoredActiveAccount(tx: tx) { account in
+                account.isDeregisteredOrDelinked = isDeregisteredOrDelinked
+            }
             return true
         }
     }
@@ -339,6 +348,11 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             kvStore.writeValue(localNumber.stringValue, forKey: Keys.reregistrationPhoneNumber, tx: tx)
             kvStore.writeValue(localAci.serviceIdUppercaseString, forKey: Keys.reregistrationAci, tx: tx)
             kvStore.writeValue(wasPrimaryDevice, forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
+            updateStoredActiveAccount(tx: tx) { account in
+                account.reregistrationPhoneNumber = localNumber.stringValue
+                account.reregistrationAci = localAci.serviceIdUppercaseString
+                account.reregistrationWasPrimaryDevice = wasPrimaryDevice
+            }
 
             let keysToKeep: Set<String> = [
                 Keys.activeAccountAci,
@@ -389,6 +403,9 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             } else {
                 kvStore.removeValue(forKey: Keys.isTransferInProgress, tx: tx)
             }
+            updateStoredActiveAccount(tx: tx) { account in
+                account.isTransferInProgress = isTransferInProgress
+            }
         }
         return true
     }
@@ -409,6 +426,9 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
             } else {
                 kvStore.removeValue(forKey: Keys.wasTransferred, tx: tx)
             }
+            updateStoredActiveAccount(tx: tx) { account in
+                account.wasTransferred = wasTransferred
+            }
         }
         return true
     }
@@ -425,6 +445,9 @@ extension TSAccountManagerImpl: LocalIdentifiersSetter {
                 }
                 Self.regStateLogger.info("Transfer was in progress but app relaunched; resetting")
                 kvStore.removeValue(forKey: Keys.isTransferInProgress, tx: tx)
+                updateStoredActiveAccount(tx: tx) { account in
+                    account.isTransferInProgress = false
+                }
             }
         }
     }
@@ -458,6 +481,12 @@ extension TSAccountManagerImpl {
         var isManualMessageFetchEnabled: Bool
         var isDiscoverableByPhoneNumber: Bool?
         var lastSetIsDiscoverableByPhoneNumberAt: Date?
+        var isDeregisteredOrDelinked: Bool?
+        var reregistrationPhoneNumber: String?
+        var reregistrationAci: String?
+        var reregistrationWasPrimaryDevice: Bool?
+        var isTransferInProgress: Bool?
+        var wasTransferred: Bool?
 
         init(
             localIdentifiers: LocalIdentifiers,
@@ -469,6 +498,12 @@ extension TSAccountManagerImpl {
             isManualMessageFetchEnabled: Bool,
             phoneNumberDiscoverability: PhoneNumberDiscoverability?,
             lastSetIsDiscoverableByPhoneNumberAt: Date?,
+            isDeregisteredOrDelinked: Bool? = nil,
+            reregistrationPhoneNumber: String? = nil,
+            reregistrationAci: String? = nil,
+            reregistrationWasPrimaryDevice: Bool? = nil,
+            isTransferInProgress: Bool? = nil,
+            wasTransferred: Bool? = nil,
         ) {
             self.aci = localIdentifiers.aci.serviceIdUppercaseString
             self.pni = localIdentifiers.pni?.rawUUID.uuidString
@@ -481,6 +516,12 @@ extension TSAccountManagerImpl {
             self.isManualMessageFetchEnabled = isManualMessageFetchEnabled
             self.isDiscoverableByPhoneNumber = phoneNumberDiscoverability?.isDiscoverable
             self.lastSetIsDiscoverableByPhoneNumberAt = lastSetIsDiscoverableByPhoneNumberAt
+            self.isDeregisteredOrDelinked = isDeregisteredOrDelinked
+            self.reregistrationPhoneNumber = reregistrationPhoneNumber
+            self.reregistrationAci = reregistrationAci
+            self.reregistrationWasPrimaryDevice = reregistrationWasPrimaryDevice
+            self.isTransferInProgress = isTransferInProgress
+            self.wasTransferred = wasTransferred
         }
 
         init(
@@ -495,6 +536,12 @@ extension TSAccountManagerImpl {
             isManualMessageFetchEnabled: Bool,
             isDiscoverableByPhoneNumber: Bool?,
             lastSetIsDiscoverableByPhoneNumberAt: Date?,
+            isDeregisteredOrDelinked: Bool? = nil,
+            reregistrationPhoneNumber: String? = nil,
+            reregistrationAci: String? = nil,
+            reregistrationWasPrimaryDevice: Bool? = nil,
+            isTransferInProgress: Bool? = nil,
+            wasTransferred: Bool? = nil,
         ) {
             self.aci = aci
             self.pni = pni
@@ -507,6 +554,12 @@ extension TSAccountManagerImpl {
             self.isManualMessageFetchEnabled = isManualMessageFetchEnabled
             self.isDiscoverableByPhoneNumber = isDiscoverableByPhoneNumber
             self.lastSetIsDiscoverableByPhoneNumberAt = lastSetIsDiscoverableByPhoneNumberAt
+            self.isDeregisteredOrDelinked = isDeregisteredOrDelinked
+            self.reregistrationPhoneNumber = reregistrationPhoneNumber
+            self.reregistrationAci = reregistrationAci
+            self.reregistrationWasPrimaryDevice = reregistrationWasPrimaryDevice
+            self.isTransferInProgress = isTransferInProgress
+            self.wasTransferred = wasTransferred
         }
 
         var localIdentifiers: LocalIdentifiers {
@@ -614,6 +667,12 @@ extension TSAccountManagerImpl {
             isManualMessageFetchEnabled: kvStore.fetchValue(Bool.self, forKey: Keys.isManualMessageFetchEnabled, tx: tx) ?? false,
             isDiscoverableByPhoneNumber: kvStore.fetchValue(Bool.self, forKey: Keys.isDiscoverableByPhoneNumber, tx: tx),
             lastSetIsDiscoverableByPhoneNumberAt: kvStore.fetchValue(Date.self, forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx),
+            isDeregisteredOrDelinked: kvStore.fetchValue(Bool.self, forKey: Keys.isDeregisteredOrDelinked, tx: tx),
+            reregistrationPhoneNumber: kvStore.fetchValue(String.self, forKey: Keys.reregistrationPhoneNumber, tx: tx),
+            reregistrationAci: kvStore.fetchValue(String.self, forKey: Keys.reregistrationAci, tx: tx),
+            reregistrationWasPrimaryDevice: kvStore.fetchValue(Bool.self, forKey: Keys.reregistrationWasPrimaryDevice, tx: tx),
+            isTransferInProgress: kvStore.fetchValue(Bool.self, forKey: Keys.isTransferInProgress, tx: tx),
+            wasTransferred: kvStore.fetchValue(Bool.self, forKey: Keys.wasTransferred, tx: tx),
         )
     }
 
@@ -629,13 +688,12 @@ extension TSAccountManagerImpl {
         kvStore.writeValue(account.isManualMessageFetchEnabled, forKey: Keys.isManualMessageFetchEnabled, tx: tx)
         kvStore.writeValue(account.isDiscoverableByPhoneNumber, forKey: Keys.isDiscoverableByPhoneNumber, tx: tx)
         kvStore.writeValue(account.lastSetIsDiscoverableByPhoneNumberAt, forKey: Keys.lastSetIsDiscoverableByPhoneNumber, tx: tx)
-
-        kvStore.removeValue(forKey: Keys.isDeregisteredOrDelinked, tx: tx)
-        kvStore.removeValue(forKey: Keys.reregistrationPhoneNumber, tx: tx)
-        kvStore.removeValue(forKey: Keys.reregistrationAci, tx: tx)
-        kvStore.removeValue(forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
-        kvStore.removeValue(forKey: Keys.isTransferInProgress, tx: tx)
-        kvStore.removeValue(forKey: Keys.wasTransferred, tx: tx)
+        kvStore.writeValue(account.isDeregisteredOrDelinked, forKey: Keys.isDeregisteredOrDelinked, tx: tx)
+        kvStore.writeValue(account.reregistrationPhoneNumber, forKey: Keys.reregistrationPhoneNumber, tx: tx)
+        kvStore.writeValue(account.reregistrationAci, forKey: Keys.reregistrationAci, tx: tx)
+        kvStore.writeValue(account.reregistrationWasPrimaryDevice, forKey: Keys.reregistrationWasPrimaryDevice, tx: tx)
+        kvStore.writeValue(account.isTransferInProgress, forKey: Keys.isTransferInProgress, tx: tx)
+        kvStore.writeValue(account.wasTransferred, forKey: Keys.wasTransferred, tx: tx)
     }
 
     private func clearLegacyAccountState(tx: DBWriteTransaction) {
